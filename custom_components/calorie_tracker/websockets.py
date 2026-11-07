@@ -17,6 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
 from .calorie_tracker_user import CalorieTrackerUser
+from .dashboard import register_dashboard_websockets
 from .const import (
     BIRTH_YEAR,
     BODY_FAT_PCT,
@@ -1098,3 +1099,4 @@ def register_websockets(hass: HomeAssistant) -> None:
             }
         )(websocket_api.async_response(websocket_get_translations)),
     )
+    register_dashboard_websockets(hass)

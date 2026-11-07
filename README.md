@@ -284,6 +284,20 @@ max_height: "400px" (Optional)
 title: "Macro Distribution" (Optional)
 ```
 
+**Health & Fitness (all-in-one):**
+
+Today's calorie ring, today's macros next to 7- and 30-day averages, last logged weight, and a scrollable list of today's food and exercise. The **Log** button opens a food dialog with search across USDA FoodData Central and your local `foods-db` files; picking a result pre-fills macros and rescales them as you change the serving size.
+```yaml
+type: custom:health-fitness-card
+profile_entity_id: sensor.calorie_tracker_<name> (Optional - defaults to the profile linked to the logged-in HA user)
+title: "Health & Fitness" (Optional)
+usda_api_key: "<key>" (Optional - free key from https://fdc.nal.usda.gov/api-key-signup ; defaults to the rate-limited DEMO_KEY)
+search_usda: true (Optional - false searches only foods-db)
+show_exercise: true (Optional)
+list_height: 360 (Optional - activity list height in px when the card is narrow)
+```
+7/30-day averages count only days with at least one food entry and exclude today. See [`foods-db/README.md`](custom_components/calorie_tracker/foods-db/README.md) for adding restaurant/brand foods.
+
 
 ## iOS/Android widgets
 
