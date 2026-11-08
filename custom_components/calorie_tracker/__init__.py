@@ -10,14 +10,6 @@ from homeassistant.components import frontend, panel_custom
 from homeassistant.config_entries import ConfigEntry, ConfigType
 from homeassistant.const import Platform
 
-# LEGACY HA Fallback
-# Try to import StaticPathConfig for newer HA versions, fall back to legacy method
-try:
-    from homeassistant.components.http import StaticPathConfig
-
-    HAS_STATIC_PATH_CONFIG = True
-except ImportError:
-    HAS_STATIC_PATH_CONFIG = False
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
@@ -25,6 +17,7 @@ from homeassistant.loader import async_get_integration
 import homeassistant.util.dt as dt_util
 
 from .calorie_tracker_user import CalorieTrackerUser
+from .frontend_view import CalorieTrackerFrontendView
 from .const import (
     BIRTH_YEAR,
     BODY_FAT_PCT,
@@ -166,24 +159,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     _LOGGER.info("Frontend path is: %s", frontend_path)
 
-    # Register static path - use modern method if available, fallback to legacy method
-    if HAS_STATIC_PATH_CONFIG:
-        # Modern method (HA 2024.5+)
-        await hass.http.async_register_static_paths(
-            [
-                StaticPathConfig(
-                    url_path=f"/{DOMAIN}_frontend",
-                    path=frontend_path,
-                )
-            ]
-        )
-    else:
-        # Legacy method (HA 2024.4.1 and earlier)
-        hass.http.register_static_path(
-            f"/{DOMAIN}_frontend", str(frontend_path), cache_headers=True
-        )
-
-    _LOGGER.info("Registered static path /%s -> %s", DOMAIN, frontend_path)
+    # Serve frontend files with explicit content types (see frontend_view.py)
+    hass.http.register_view(CalorieTrackerFrontendView())
+    _LOGGER.info("Serving /%s_frontend from %s", DOMAIN, frontend_path)
 
     integration = await async_get_integration(hass, DOMAIN)
     panel_mtime = int((frontend_path / "calorie-tracker-panel.js").stat().st_mtime)
@@ -200,6 +178,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         sidebar_icon="mdi:scale-bathroom",
         embed_iframe=False,
         **extra_panel_kwargs,
+    )
+
+    # Load the dashboard cards on every dashboard automatically, so no manual
+    # Lovelace resource is needed. The version + mtime query busts caches
+    # whenever the bundle is rebuilt or the integration is updated.
+    cards_mtime = int((frontend_path / "cards.js").stat().st_mtime)
+    frontend.add_extra_js_url(
+        hass, f"/{DOMAIN}_frontend/cards.js?v={integration.version}-{cards_mtime}"
     )
 
     # Register HTTP endpoints
