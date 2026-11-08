@@ -372,7 +372,8 @@ class HealthFitnessCard extends LitElement {
             : html`
                 <div class="layout">
                   <div class="left">
-                    ${this._renderRing()} ${this._renderMacroTable()} ${this._renderWeight()}
+                    ${this._renderRing()} ${this._renderMacroTable()} ${this._renderActivityTile()}
+                    ${this._renderWeight()}
                   </div>
                   <div class="right" style="--hf-list-height:${Number(this._config.list_height) || 360}px">
                     ${this._renderActivity()}
@@ -419,6 +420,12 @@ class HealthFitnessCard extends LitElement {
                 </div>
               `
             : html`<div class="stat"><span class="stat-label">No calorie goal set</span></div>`}
+          ${this._stats.health?.steps_linked
+            ? html`<div class="stat">
+                <span class="stat-num">${this._fmt(this._stats.health.steps)}</span>
+                <span class="stat-label">steps</span>
+              </div>`
+            : nothing}
           ${exercise > 0
             ? html`<div class="stat">
                 <span class="stat-num">${this._fmt(exercise)}</span>
@@ -468,6 +475,34 @@ class HealthFitnessCard extends LitElement {
           (m) => html`<span class="seg ${m.key}" style="flex-grow:${kcal[m.key]}"
             >${kcal[m.key] / total >= 0.12 ? `${Math.round((kcal[m.key] / total) * 100)}%` : ''}</span>`,
         )}
+      </div>
+    `;
+  }
+
+  _renderActivityTile() {
+    const h = this._stats.health;
+    if (!h?.active_linked) return nothing;
+    const active = h.active_kcal;
+    const budget = h.estimated_activity_kcal;
+    const pct = active !== null && budget > 0 ? Math.min(active / budget, 1) : 0;
+    const title =
+      'Your activity multiplier already budgets this much movement per day. ' +
+      'Only active calories above it (minus exercise you logged yourself) are added as exercise.';
+    return html`
+      <div class="tile" title=${title}>
+        <div class="tile-row">
+          <ha-icon icon="mdi:fire"></ha-icon>
+          <span class="tile-label">Active</span>
+          <span class="tile-value">${active === null ? '—' : this._fmt(active)}<small> / ${this._fmt(budget)} kcal</small></span>
+        </div>
+        <div class="meter"><span style="width:${pct * 100}%"></span></div>
+        <div class="tile-note">
+          ${active === null
+            ? 'Waiting for today\'s first Apple Health reading'
+            : h.credited_kcal > 0
+              ? html`<span class="good">+${this._fmt(h.credited_kcal)} kcal</span> above your usual day, added as exercise`
+              : `${this._fmt(Math.max(0, budget - active))} kcal until extra activity counts`}
+        </div>
       </div>
     `;
   }
@@ -707,6 +742,35 @@ class HealthFitnessCard extends LitElement {
         .seg.p { background: var(--hf-protein); }
         .seg.c { background: var(--hf-carbs); }
         .seg.f { background: var(--hf-fat); }
+
+        /* Activity tile */
+        .tile {
+          padding: 10px 12px;
+          border-radius: 10px;
+          background: var(--secondary-background-color, rgba(127, 127, 127, 0.08));
+          font-size: 0.9rem;
+        }
+        .tile-row { display: flex; align-items: center; gap: 8px; }
+        .tile-row ha-icon { color: var(--hf-carbs); --mdc-icon-size: 20px; }
+        .tile-label { color: var(--hf-muted); }
+        .tile-value { margin-left: auto; font-weight: 600; color: var(--primary-text-color); }
+        .tile-value small { font-weight: 400; color: var(--hf-muted); font-size: 0.8rem; }
+        .meter {
+          height: 6px;
+          border-radius: 3px;
+          margin: 8px 0 6px;
+          background: var(--hf-divider);
+          overflow: hidden;
+        }
+        .meter span {
+          display: block;
+          height: 100%;
+          background: var(--hf-carbs);
+          border-radius: 3px;
+          transition: width 0.6s ease;
+        }
+        .tile-note { font-size: 0.78rem; color: var(--hf-muted); }
+        .tile-note .good { color: var(--hf-good); font-weight: 600; }
 
         /* Weight */
         .weight {

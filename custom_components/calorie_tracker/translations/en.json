@@ -78,5 +78,18 @@
         "metric": "Metric (cm)"
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Health sensors",
+        "description": "Link sensors to pull data automatically, e.g. the Home Assistant iOS app's Apple Health sensors (Settings > Companion app > Labs). Weight readings are logged as daily weigh-ins. Active calories only count as exercise when they exceed what your activity multiplier already assumes for the day (BMR × (multiplier − 1)), minus any exercise you logged yourself.",
+        "data": {
+          "health_steps_entity": "Steps today",
+          "health_weight_entity": "Weight",
+          "health_active_energy_entity": "Active calories today"
+        }
+      }
+    }
   }
 }

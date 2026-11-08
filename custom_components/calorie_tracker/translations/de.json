@@ -78,5 +78,18 @@
         "metric": "Metrisch (cm)"
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Gesundheitssensoren",
+        "description": "Sensoren verknüpfen, um Daten automatisch zu übernehmen, z. B. die Apple-Health-Sensoren der Home-Assistant-iOS-App (Einstellungen > Companion-App > Labs). Gewichtswerte werden als tägliche Messung gespeichert. Aktivkalorien zählen nur als Training, soweit sie über dem liegen, was dein Aktivitätsfaktor bereits annimmt (BMR × (Faktor − 1)), abzüglich selbst erfasster Trainings.",
+        "data": {
+          "health_steps_entity": "Schritte heute",
+          "health_weight_entity": "Gewicht",
+          "health_active_energy_entity": "Aktivkalorien heute"
+        }
+      }
+    }
   }
 }

@@ -82,10 +82,11 @@ def _average(days: list[dict[str, float]]) -> dict[str, Any]:
 
 async def websocket_get_dashboard_stats(hass: HomeAssistant, connection, msg):
     """Return everything the Health & Fitness card needs in one round trip."""
-    _, user = _resolve_user(hass, msg["entity_id"])
+    config_entry, user = _resolve_user(hass, msg["entity_id"])
     if user is None:
         connection.send_error(msg["id"], "not_found", "Calorie Tracker profile not found")
         return
+    health_sync = config_entry.runtime_data.get("health_sync")
 
     today: date = dt_util.now().date()
     if msg.get("date"):
@@ -146,6 +147,11 @@ async def websocket_get_dashboard_stats(hass: HomeAssistant, connection, msg):
                     "unit": user.get_weight_unit(),
                 }
                 if last_weight
+                else None
+            ),
+            "health": (
+                health_sync.summary()
+                if health_sync and today_iso == dt_util.now().date().isoformat()
                 else None
             ),
             "food_entries": log.get("food_entries", []),

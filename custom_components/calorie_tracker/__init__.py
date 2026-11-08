@@ -18,6 +18,7 @@ import homeassistant.util.dt as dt_util
 
 from .calorie_tracker_user import CalorieTrackerUser
 from .frontend_view import CalorieTrackerFrontendView
+from .health_sync import HealthSync
 from .const import (
     BIRTH_YEAR,
     BODY_FAT_PCT,
@@ -295,9 +296,24 @@ async def async_setup_entry(
 
     await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
 
+    # Steps / weight / active calories from linked sensors (Apple Health etc.)
+    health_sync = HealthSync(hass, entry, user)
+    entry.runtime_data["health_sync"] = health_sync
+    health_sync.async_start()
+    entry.async_on_unload(health_sync.async_stop)
+    # Re-wire when the linked sensors change in the Configure dialog.
+    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
+
     _LOGGER.info("Finished async_setup_entry for entry: %s", entry.entry_id)
 
     return True
+
+
+async def _async_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Restart health sensor listeners after options change."""
+    health_sync = (entry.runtime_data or {}).get("health_sync")
+    if health_sync:
+        health_sync.async_start()
 
 
 async def async_unload_entry(

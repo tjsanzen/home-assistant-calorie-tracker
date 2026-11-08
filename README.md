@@ -58,6 +58,16 @@ The integration supports multiple goal types to fit different approaches to calo
 - **`Gain Percent Body Fat Per Week`**: Calculates a net calorie daily goal to gain a specific weekly body fat percentage per week (0.25-0.5% recommended)
 
 
+## Apple Health: steps, weight and active calories
+
+Link sensors under **Settings > Devices & services > Calorie Tracker > Configure** (per profile). Built for the Home Assistant iOS app's Apple Health sensors (enable them in the app under **Settings > Companion app > Labs**), but any sensor works (Withings, Garmin, Fitbit, etc.).
+
+- **Weight**: each new reading is logged as that day's weigh-in, converted to your profile's unit.
+- **Steps today**: shown on the Health & Fitness card.
+- **Active calories today**: your activity multiplier already budgets a normal day's movement (BMR × (multiplier − 1)). Only active calories *above* that, minus any exercise you logged yourself (e.g. Peloton), are added, as a single "Extra activity (Apple Health)" exercise entry that updates through the day.
+
+iOS only shares Health data when the phone allows background delivery, so readings can lag a little, especially while the phone is locked.
+
 ## Auto logging Peloton workouts
 
 - The Calorie Tracker integration will detect if there is a [Home Assistant Peloton Sensor](https://github.com/edwork/homeassistant-peloton-sensor) profile and allow you to link the Peloton profile to a Calorie Tracker profile. Peloton workouts will then be auto logged.

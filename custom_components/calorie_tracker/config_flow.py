@@ -8,7 +8,8 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
+from homeassistant.core import callback
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv, selector
 from homeassistant.helpers.selector import (
@@ -18,6 +19,7 @@ from homeassistant.helpers.selector import (
 )
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
+from .health_sync import HEALTH_OPTION_KEYS
 from .const import (
     BIRTH_YEAR,
     BODY_FAT_PCT,
@@ -183,6 +185,12 @@ class CalorieConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Calorie Tracker."""
 
     VERSION = 6
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Options: link health sensors (Apple Health via the companion app, etc.)."""
+        return CalorieOptionsFlow(config_entry)
 
     def __init__(self) -> None:
         """Initialize ConfigFlow."""
@@ -431,3 +439,31 @@ class CalorieConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="link_component",
             data_schema=vol.Schema(schema_dict),
         )
+
+
+class CalorieOptionsFlow(OptionsFlow):
+    """Link steps, weight and active-calorie sensors to this profile."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Store the entry (works before and after HA 2024.11's config_entry property)."""
+        self._entry = config_entry
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None):
+        """Pick the sensors."""
+        options = dict(self._entry.options or {})
+        if user_input is not None:
+            for key in HEALTH_OPTION_KEYS:
+                if user_input.get(key):
+                    options[key] = user_input[key]
+                else:
+                    options.pop(key, None)  # cleared in the form
+            return self.async_create_entry(title="", data=options)
+
+        sensor = selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
+        schema = vol.Schema(
+            {
+                vol.Optional(key, description={"suggested_value": options.get(key)}): sensor
+                for key in HEALTH_OPTION_KEYS
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)
