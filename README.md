@@ -285,17 +285,18 @@ title: "Macro Distribution" (Optional)
 
 **Health & Fitness (all-in-one):**
 
-Today's calorie ring, today's macros next to 7- and 30-day averages, last logged weight, and a scrollable list of today's food and exercise. The **Log** button opens a food dialog with search across USDA FoodData Central and your local `foods-db` files; picking a result pre-fills macros and rescales them as you change the serving size.
+Today's calorie ring, today's macros next to 7- and 30-day averages, last logged weight, and a scrollable list of today's food and exercise. The **Log** button opens a food dialog with two tabs: **My meals** and **Foods**. *Foods* shows what you've logged recently, searches your own history instantly (opening at the amount you had last time), then adds **USDA FoodData Central** results below. If USDA is slow or down, your history still works; USDA errors are logged to the Home Assistant log with details. USDA's shared `DEMO_KEY` has very low rate limits, so a free API key is recommended. Picking a result pre-fills macros and rescales them as you change the amount and unit (g, oz, cups, tbsp, or the food's own portions like "1 medium").
 ```yaml
 type: custom:health-fitness-card
 profile_entity_id: sensor.calorie_tracker_<name> (Optional - defaults to the profile linked to the logged-in HA user)
 title: "Health & Fitness" (Optional)
 usda_api_key: "<key>" (Optional - free key from https://fdc.nal.usda.gov/api-key-signup ; defaults to the rate-limited DEMO_KEY)
-search_usda: true (Optional - false searches only foods-db)
+search_usda: true (Optional - false skips USDA and only searches your logged foods and My meals)
 show_exercise: true (Optional)
 list_height: 360 (Optional - activity list height in px when the card is narrow)
 ```
-7/30-day averages count only days with at least one food entry and exclude today. See [`foods-db/README.md`](custom_components/calorie_tracker/foods-db/README.md) for adding restaurant/brand foods.
+7/30-day averages count only days with at least one food entry and exclude today. 
+**My meals**: in the Log dialog, switch to *My meals* and tap **New meal**. Name it, set how many servings the recipe makes, and add ingredients from USDA search or by hand. Saved meals are searchable by name or ingredient and log per serving (or by weight, when every ingredient has one). Tap the pencil on a meal to edit or delete it. Meals are shared by all profiles and stored in `<config>/calorie_tracker/my_meals.json`, which you can also edit by hand; totals are recalculated from the ingredients.
 
 
 ## iOS/Android widgets

@@ -2,17 +2,17 @@
 
 - ``calorie_tracker/get_dashboard_stats``: today's calorie budget, today's
   macros, 7/30-day macro averages and the last logged weight in one call.
-- ``calorie_tracker/search_foods``: searches the local ``foods-db`` JSON files
-  and USDA FoodData Central, returning results in one normalized shape.
+- ``calorie_tracker/search_foods``: searches USDA FoodData Central and returns
+  results in a normalized shape (saved meals live in ``meals.py``).
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, timedelta
-import json
 import logging
 import re
-from pathlib import Path
+import time
 from typing import Any
 
 import aiohttp
@@ -24,19 +24,17 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.util.dt as dt_util
 
-from .const import DOMAIN
+from .meals import register_meal_websockets
 
 _LOGGER = logging.getLogger(__name__)
 
-# Bundled database ships with the integration; the user database lives in the
-# HA config dir so it survives HACS updates.
-BUNDLED_FOODS_DB = Path(__file__).parent / "foods-db"
-USER_FOODS_DB_SUBDIR = Path(DOMAIN) / "foods-db"
 
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 USDA_FOOD_URL = "https://api.nal.usda.gov/fdc/v1/food/{fdc_id}"
 USDA_DATA_TYPES = "Foundation,SR Legacy,Survey (FNDDS),Branded"
-USDA_TIMEOUT = aiohttp.ClientTimeout(total=10)
+USDA_TIMEOUT = aiohttp.ClientTimeout(total=15)
+USDA_CACHE_TTL = 15 * 60  # seconds
+USDA_CACHE_MAX = 200
 
 # FoodData Central nutrient ids
 NUTRIENT_ENERGY_KCAL = (1008, 2047, 2048)
@@ -164,8 +162,6 @@ async def websocket_get_dashboard_stats(hass: HomeAssistant, connection, msg):
 # Food search
 # ---------------------------------------------------------------------------
 
-_local_db_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-
 # --- Portions / household measures -------------------------------------------
 # A portion is a named amount of one specific food with a known gram weight,
 # e.g. "1 cup, sliced" = 150 g. Volume portions also let the frontend work out
@@ -269,79 +265,6 @@ def _num(value: Any) -> float | None:
         return None
 
 
-def _load_foods_db_sync(directories: list[Path]) -> list[dict[str, Any]]:
-    """Load every *.json file in the foods-db folders (cached by mtime).
-
-    Files starting with ``_`` are ignored (templates/examples).
-    """
-    items: list[dict[str, Any]] = []
-    for directory in directories:
-        if not directory.is_dir():
-            continue
-        for file in sorted(directory.glob("*.json")):
-            if file.name.startswith("_"):
-                continue
-            key = str(file)
-            mtime = file.stat().st_mtime
-            cached = _local_db_cache.get(key)
-            if cached and cached[0] == mtime:
-                items.extend(cached[1])
-                continue
-            try:
-                data = json.loads(file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                _LOGGER.warning("Skipping unreadable foods-db file %s", file)
-                continue
-            brand = data.get("brand") or file.stem
-            parsed: list[dict[str, Any]] = []
-            for raw in data.get("items", []):
-                name = raw.get("name")
-                serving_g = _num(raw.get("serving_g"))
-                if not name or not serving_g:
-                    continue
-                portions = [_make_portion(raw.get("serving_label") or "1 serving", serving_g)]
-                portions += [
-                    _make_portion(p.get("label"), p.get("grams"))
-                    for p in raw.get("portions", [])
-                    if isinstance(p, dict)
-                ]
-                parsed.append(
-                    {
-                        "source": "local",
-                        "source_label": brand,
-                        "id": f"{file.stem}:{name}",
-                        "name": name,
-                        "brand": brand,
-                        # Local values are per serving.
-                        "base_g": serving_g,
-                        "default_g": serving_g,
-                        "serving_label": raw.get("serving_label"),
-                        "calories": _num(raw.get("calories")),
-                        "protein": _num(raw.get("protein")),
-                        "carbs": _num(raw.get("carbs")),
-                        "fat": _num(raw.get("fat")),
-                        "portions": _dedupe_portions(portions),
-                        "_haystack": f"{brand} {name} {' '.join(raw.get('aliases', []))}".lower(),
-                    }
-                )
-            _local_db_cache[key] = (mtime, parsed)
-            items.extend(parsed)
-    return items
-
-
-def _search_local(items: list[dict[str, Any]], query: str, limit: int) -> list[dict[str, Any]]:
-    tokens = [t for t in query.lower().replace("'", "").split() if t]
-    if not tokens:
-        return []
-    hits = []
-    for item in items:
-        haystack = item["_haystack"].replace("'", "")
-        if all(t in haystack for t in tokens):
-            hits.append({k: v for k, v in item.items() if k != "_haystack"})
-    hits.sort(key=lambda i: len(i["name"]))
-    return hits[:limit]
-
-
 def _pretty(text: str | None) -> str | None:
     if not text:
         return text
@@ -404,23 +327,82 @@ def _normalize_usda(food: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+class UsdaError(Exception):
+    """A USDA request failed; the message is shown to the user."""
+
+
+_usda_cache: dict[tuple, tuple[float, Any]] = {}
+
+
+async def _usda_get(hass: HomeAssistant, url: str, params: dict[str, str]) -> dict[str, Any]:
+    """GET a USDA endpoint with one retry, readable errors and a short cache.
+
+    USDA FoodData Central is often slow and returns occasional 5xx errors, and
+    the shared DEMO_KEY is heavily rate limited, so: retry once on timeouts,
+    connection errors and 5xx; cache successful responses for 15 minutes.
+    """
+    key = (url, tuple(sorted((k, v) for k, v in params.items())))
+    cached = _usda_cache.get(key)
+    if cached and time.monotonic() - cached[0] < USDA_CACHE_TTL:
+        return cached[1]
+
+    session = async_get_clientsession(hass)
+    demo = params.get("api_key") == "DEMO_KEY"
+    last_error = "Couldn't reach USDA FoodData Central."
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(0.8)
+        try:
+            async with session.get(url, params=params, timeout=USDA_TIMEOUT) as resp:
+                if resp.status == 429:
+                    raise UsdaError(
+                        "USDA's hourly limit for the shared demo key is used up. "
+                        "Add your own free API key in the card settings."
+                        if demo
+                        else "USDA rate limit reached for your API key. Try again later."
+                    )
+                if resp.status in (401, 403):
+                    raise UsdaError("USDA rejected the API key. Check it in the card settings.")
+                if resp.status >= 500:
+                    last_error = f"USDA is having problems right now (error {resp.status}). Try again shortly."
+                    _LOGGER.warning("USDA returned %s for %s (attempt %s)", resp.status, url, attempt + 1)
+                    continue
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        except UsdaError:
+            raise
+        except TimeoutError:
+            last_error = "USDA didn't respond in time (it's often slow). Try again in a moment."
+            _LOGGER.warning("USDA request timed out: %s (attempt %s)", url, attempt + 1)
+            continue
+        except aiohttp.ClientResponseError as err:
+            raise UsdaError(f"USDA returned an error ({err.status}).") from err
+        except aiohttp.ClientError as err:
+            last_error = f"Couldn't connect to USDA from Home Assistant ({type(err).__name__})."
+            _LOGGER.warning("USDA connection failed: %s (attempt %s)", err, attempt + 1)
+            continue
+        except ValueError as err:  # not JSON (proxy or maintenance page)
+            last_error = "USDA sent an unexpected response. Try again shortly."
+            _LOGGER.warning("USDA response was not JSON: %s", err)
+            continue
+
+        if len(_usda_cache) >= USDA_CACHE_MAX:
+            _usda_cache.pop(next(iter(_usda_cache)))
+        _usda_cache[key] = (time.monotonic(), data)
+        return data
+    raise UsdaError(last_error)
+
+
 async def _search_usda(
     hass: HomeAssistant, query: str, api_key: str, limit: int
 ) -> list[dict[str, Any]]:
-    session = async_get_clientsession(hass)
     params = {
-        "query": query,
+        "query": query.lower(),
         "pageSize": str(limit),
         "dataType": USDA_DATA_TYPES,
         "api_key": api_key,
     }
-    async with session.get(USDA_SEARCH_URL, params=params, timeout=USDA_TIMEOUT) as resp:
-        if resp.status == 429:
-            raise RuntimeError("USDA rate limit reached. Add your own free API key in the card settings.")
-        if resp.status in (401, 403):
-            raise RuntimeError("USDA rejected the API key.")
-        resp.raise_for_status()
-        data = await resp.json(content_type=None)
+    data = await _usda_get(hass, USDA_SEARCH_URL, params)
     results = []
     for food in data.get("foods", []):
         item = _normalize_usda(food)
@@ -430,7 +412,7 @@ async def _search_usda(
 
 
 async def websocket_search_foods(hass: HomeAssistant, connection, msg):
-    """Search local foods-db files and USDA FoodData Central."""
+    """Search USDA FoodData Central. (Saved meals are filtered in the browser.)"""
     query = (msg.get("query") or "").strip()
     limit = msg.get("limit", 20)
     if len(query) < 2:
@@ -438,37 +420,22 @@ async def websocket_search_foods(hass: HomeAssistant, connection, msg):
         return
 
     errors: list[str] = []
-    directories = [BUNDLED_FOODS_DB, Path(hass.config.path(str(USER_FOODS_DB_SUBDIR)))]
-    local_items = await hass.async_add_executor_job(_load_foods_db_sync, directories)
-    results = _search_local(local_items, query, limit)
-
-    if msg.get("include_usda", True):
-        try:
-            results.extend(
-                await _search_usda(hass, query, msg.get("usda_api_key") or "DEMO_KEY", limit)
-            )
-        except RuntimeError as err:
-            errors.append(str(err))
-        except (aiohttp.ClientError, TimeoutError) as err:
-            _LOGGER.debug("USDA search failed: %s", err)
-            errors.append("Couldn't reach USDA FoodData Central.")
+    results: list[dict[str, Any]] = []
+    try:
+        results = await _search_usda(hass, query, msg.get("usda_api_key") or "DEMO_KEY", limit)
+    except UsdaError as err:
+        errors.append(str(err))
 
     connection.send_result(msg["id"], {"results": results, "errors": errors})
 
 
 async def websocket_get_food_portions(hass: HomeAssistant, connection, msg):
     """Fetch household measures (cup, slice, medium...) for one USDA food."""
-    session = async_get_clientsession(hass)
     url = USDA_FOOD_URL.format(fdc_id=msg["fdc_id"])
     try:
-        async with session.get(
-            url, params={"api_key": msg.get("usda_api_key") or "DEMO_KEY"}, timeout=USDA_TIMEOUT
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
-    except (aiohttp.ClientError, TimeoutError) as err:
-        _LOGGER.debug("USDA portion lookup failed for %s: %s", msg["fdc_id"], err)
-        connection.send_result(msg["id"], {"portions": [], "error": "Couldn't load serving sizes."})
+        data = await _usda_get(hass, url, {"api_key": msg.get("usda_api_key") or "DEMO_KEY"})
+    except UsdaError as err:
+        connection.send_result(msg["id"], {"portions": [], "error": str(err)})
         return
 
     raw_portions = sorted(data.get("foodPortions") or [], key=lambda p: p.get("sequenceNumber") or 999)
@@ -478,8 +445,120 @@ async def websocket_get_food_portions(hass: HomeAssistant, connection, msg):
     connection.send_result(msg["id"], {"portions": _dedupe_portions(portions)})
 
 
+# ---------------------------------------------------------------------------
+# Previously logged foods
+# ---------------------------------------------------------------------------
+
+# Matches the amount suffix the card appends: "(150 g)", "(1.5 cup · ~355 g)", "(1 serving)"
+_SUFFIX_RE = re.compile(r"\s*\(([^()]*\d[^()]*)\)\s*$")
+_GRAMS_RE = re.compile(r"~?\s*(\d+(?:\.\d+)?)\s*g$")
+_QTY_UNIT_RE = re.compile(r"^(\d+(?:\.\d+)?)\s+(.+)$")
+_VOLUME_IDS = {"cup": "cup", "tbsp": "tbsp", "tsp": "tsp", "fl oz": "floz", "ml": "ml"}
+
+
+def _parse_logged_name(food_item: str) -> tuple[str, float | None, str | None, float | None]:
+    """Split "Oats (1.5 cup · ~120 g)" into (name, qty, unit, grams)."""
+    match = _SUFFIX_RE.search(food_item or "")
+    if not match:
+        return (food_item or "").strip(), None, None, None
+    name = food_item[: match.start()].strip()
+    parts = [p.strip() for p in match.group(1).split("·")]
+    qty = unit = grams = None
+    gm = _GRAMS_RE.match(parts[-1])
+    if gm:
+        grams = float(gm.group(1))
+    qm = _QTY_UNIT_RE.match(parts[0])
+    if qm and not (len(parts) == 1 and gm):
+        qty, unit = float(qm.group(1)), qm.group(2).strip()
+    elif gm:
+        qty, unit = grams, "g"
+    if qty is None:
+        return food_item.strip(), None, None, None  # parentheses weren't an amount
+    return name or food_item.strip(), qty, unit, grams
+
+
+def _history_item(entry: dict[str, Any], times: int) -> dict[str, Any]:
+    name, qty, unit, grams = _parse_logged_name(entry.get("food_item", ""))
+    item: dict[str, Any] = {
+        "source": "history",
+        "source_label": "Logged before",
+        "id": f"history:{entry.get('id')}",
+        "name": name,
+        "brand": None,
+        "calories": float(entry.get("calories") or 0),
+        "protein": _num(entry.get("p")),
+        "carbs": _num(entry.get("c")),
+        "fat": _num(entry.get("f")),
+        "times_logged": times,
+        "last_logged": (entry.get("timestamp") or "")[:10],
+    }
+    if grams and qty:
+        # Weighed: scale by grams, and remember the unit it was logged in.
+        item.update(base_g=grams, default_g=grams, portions_only=False)
+        item["portions"] = (
+            [{"unit_label": unit, "per_unit_g": round(grams / qty, 3), "volume_unit": _VOLUME_IDS.get(unit)}]
+            if unit != "g"
+            else []
+        )
+        item["last"] = {"qty": qty, "unit": unit}
+    else:
+        # No weight: offer the same unit it was logged in (or "serving").
+        qty = qty or 1.0
+        unit = unit or "serving"
+        item.update(base_g=qty, default_g=qty, portions_only=True)
+        item["portions"] = [{"unit_label": unit, "per_unit_g": 1, "volume_unit": None}]
+        item["last"] = {"qty": qty, "unit": unit}
+    return item
+
+
+async def websocket_search_history(hass: HomeAssistant, connection, msg):
+    """Foods this profile logged before, newest version of each, best matches first.
+
+    An empty query returns the most recently logged distinct foods.
+    """
+    _, user = _resolve_user(hass, msg["entity_id"])
+    if user is None:
+        connection.send_error(msg["id"], "not_found", "Calorie Tracker profile not found")
+        return
+    query = (msg.get("query") or "").strip().lower()
+    tokens = query.split()
+    latest: dict[str, dict[str, Any]] = {}
+    counts: dict[str, int] = {}
+    for entry in user.storage().get_food_entries():
+        name = _parse_logged_name(entry.get("food_item", ""))[0]
+        key = name.lower()
+        if not key or (tokens and not all(t in key for t in tokens)):
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        current = latest.get(key)
+        if current is None or (entry.get("timestamp") or "") >= (current.get("timestamp") or ""):
+            latest[key] = entry
+
+    # Newest first, then (when searching) prefix matches and most-logged foods
+    # first; Python's sort is stable so recency breaks the ties.
+    keys = sorted(latest, key=lambda k: latest[k].get("timestamp") or "", reverse=True)
+    if tokens:
+        keys.sort(key=lambda k: (0 if k.startswith(query) else 1, -counts[k]))
+    keys = keys[: msg.get("limit", 8)]
+    connection.send_result(
+        msg["id"], {"results": [_history_item(latest[k], counts[k]) for k in keys]}
+    )
+
+
 def register_dashboard_websockets(hass: HomeAssistant) -> None:
     """Register the dashboard card websocket commands."""
+    register_meal_websockets(hass)
+    websocket_api.async_register_command(
+        hass,
+        websocket_api.websocket_command(
+            {
+                vol.Required("type"): "calorie_tracker/search_history",
+                vol.Required("entity_id"): str,
+                vol.Optional("query", default=""): str,
+                vol.Optional("limit", default=8): vol.All(int, vol.Range(min=1, max=50)),
+            }
+        )(websocket_api.async_response(websocket_search_history)),
+    )
     websocket_api.async_register_command(
         hass,
         websocket_api.websocket_command(
@@ -497,7 +576,6 @@ def register_dashboard_websockets(hass: HomeAssistant) -> None:
                 vol.Required("type"): "calorie_tracker/search_foods",
                 vol.Required("query"): str,
                 vol.Optional("usda_api_key"): str,
-                vol.Optional("include_usda", default=True): bool,
                 vol.Optional("limit", default=20): vol.All(int, vol.Range(min=1, max=50)),
             }
         )(websocket_api.async_response(websocket_search_foods)),

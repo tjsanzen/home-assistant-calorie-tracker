@@ -7,7 +7,7 @@ import { LitElement, html, css, svg, nothing } from 'lit';
  *   profile_entity_id: sensor.calorie_tracker_tovin   # optional, falls back to the user's default profile
  *   title: Health & Fitness                           # optional
  *   usda_api_key: xxxxx                               # optional, defaults to USDA's rate-limited DEMO_KEY
- *   search_usda: true                                 # optional, set false to only search foods-db
+ *   search_usda: true                                 # optional, false = only your logged foods + My meals
  *   show_exercise: true                               # optional, include exercise in the activity list
  *   list_height: 360                                  # optional, activity list height (px) when stacked on narrow screens
  */
@@ -127,6 +127,9 @@ function fmtAmount(n) {
 function buildUnits(item) {
   const units = [];
   const portions = item?.portions || [];
+  if (item?.portions_only) {
+    return portions.map((p, i) => ({ id: `p${i}`, label: p.unit_label, group: 'food', g: p.per_unit_g, quality: 'exact' }));
+  }
   const volumePortion =
     portions.find((p) => p.volume_unit === 'cup') || portions.find((p) => p.volume_unit);
   const density = volumePortion ? volumePortion.per_unit_g / ML_PER[volumePortion.volume_unit] : null;
@@ -230,7 +233,7 @@ class HealthFitnessCard extends LitElement {
           title: 'Title',
           profile_entity_id: 'Calorie Tracker profile (defaults to your own)',
           usda_api_key: 'USDA FoodData Central API key (optional)',
-          search_usda: 'Search USDA database',
+          search_usda: 'Search USDA too (off = only your own foods and meals)',
           show_exercise: 'Show exercise in activity list',
           list_height: 'Activity list height on narrow screens',
         })[s.name],
@@ -869,6 +872,26 @@ class HealthFitnessCard extends LitElement {
 /* Log dialog (appended to <body> so dashboard layouts can't clip it)        */
 /* ------------------------------------------------------------------------- */
 
+const SOURCE_KEY = 'calorie-tracker-search-source';
+
+function loadSource() {
+  try {
+    return localStorage.getItem(SOURCE_KEY) === 'meals' ? 'meals' : 'foods';
+  } catch (err) {
+    return 'foods';
+  }
+}
+
+function saveSource(value) {
+  try {
+    localStorage.setItem(SOURCE_KEY, value);
+  } catch (err) {
+    // Storage unavailable (private mode, some webviews): just don't remember.
+  }
+}
+
+const EMPTY_FORM = { name: '', amount: '', unit: 'g', calories: '', p: '', c: '', f: '' };
+
 class HfLogDialog extends LitElement {
   static get properties() {
     return {
@@ -876,6 +899,14 @@ class HfLogDialog extends LitElement {
       entityId: { attribute: false },
       usdaApiKey: { attribute: false },
       searchUsda: { attribute: false },
+      _view: { state: true }, // 'log' | 'meal' (builder) | 'ingredient' (adding one to the meal)
+      _source: { state: true }, // 'meals' | 'foods' (logged before + USDA)
+      _history: { state: true },
+      _meals: { state: true },
+      _mealsError: { state: true },
+      _mealDraft: { state: true },
+      _mealSaving: { state: true },
+      _confirmDelete: { state: true },
       _query: { state: true },
       _results: { state: true },
       _searching: { state: true },
@@ -892,21 +923,21 @@ class HfLogDialog extends LitElement {
 
   constructor() {
     super();
-    this._query = '';
-    this._results = [];
-    this._searching = false;
-    this._searchErrors = [];
-    this._selected = null;
-    this._units = buildUnits(null);
-    this._loadingPortions = false;
-    this._form = { name: '', amount: '', unit: 'g', calories: '', p: '', c: '', f: '' };
-    this._unitTouched = false;
-    this._caloriesTouched = false;
-    this._saving = false;
-    this._error = null;
+    this._view = 'log';
+    this._source = loadSource();
+    this._meals = null;
+    this._mealsError = null;
+    this._mealDraft = null;
+    this._mealSaving = false;
+    this._confirmDelete = false;
     this._searchSeq = 0;
+    this._resetForm();
+    this._saving = false;
     this._onKey = (e) => {
-      if (e.key === 'Escape') this._close();
+      if (e.key !== 'Escape') return;
+      if (this._view === 'ingredient') this._backToMeal();
+      else if (this._view === 'meal') this._backToLog();
+      else this._close();
     };
   }
 
@@ -922,37 +953,113 @@ class HfLogDialog extends LitElement {
   }
 
   firstUpdated() {
-    this.renderRoot.querySelector('#search')?.focus();
+    this._focusSearch();
+    this._loadMeals();
+    this._searchHistory();
   }
 
   _close() {
     this.remove();
   }
 
-  /* ---------- search ---------- */
+  _focusSearch() {
+    this.updateComplete.then(() => this.renderRoot.querySelector('#search')?.focus());
+  }
+
+  _resetForm() {
+    this._query = '';
+    this._history = [];
+    this._results = [];
+    this._searching = false;
+    this._searchErrors = [];
+    this._selected = null;
+    this._units = buildUnits(null);
+    this._loadingPortions = false;
+    this._form = { ...EMPTY_FORM };
+    this._unitTouched = false;
+    this._caloriesTouched = false;
+    this._error = null;
+  }
+
+  /* ---------- sources & search ---------- */
+
+  get _activeSource() {
+    // Ingredients for a meal come from foods (logged before + USDA) or manual entry.
+    return this._view === 'ingredient' ? 'foods' : this._source;
+  }
+
+  get _usdaEnabled() {
+    return this.searchUsda !== false;
+  }
+
+  _setSource(source) {
+    if (source === this._source) return;
+    this._source = source;
+    saveSource(source);
+    this._results = [];
+    this._searchErrors = [];
+    this._searching = false;
+    if (source === 'foods') {
+      this._searchHistory();
+      if (this._query.trim().length >= 2) this._search();
+    }
+    this._focusSearch();
+  }
+
+  async _loadMeals() {
+    try {
+      const resp = await this.hass.callWS({ type: 'calorie_tracker/meals/list' });
+      this._meals = resp.meals || [];
+      this._mealsError = null;
+    } catch (err) {
+      this._meals = [];
+      this._mealsError =
+        err?.code === 'unknown_command'
+          ? 'Saved meals need the updated integration. Restart Home Assistant.'
+          : err.message || String(err);
+    }
+  }
 
   _onSearchInput(e) {
     this._query = e.target.value;
+    if (this._activeSource === 'meals') return; // filtered locally in render
+    // Your own foods are local and fast: search them almost immediately.
+    clearTimeout(this._historyTimer);
+    this._historyTimer = setTimeout(() => this._searchHistory(), 120);
     clearTimeout(this._searchTimer);
-    if (this._query.trim().length < 2) {
+    if (this._query.trim().length < 2 || !this._usdaEnabled) {
+      this._searchSeq++; // drop any USDA reply still in flight
       this._results = [];
       this._searchErrors = [];
       this._searching = false;
       return;
     }
     this._searching = true;
-    this._searchTimer = setTimeout(() => this._search(), 400);
+    // USDA is slow and rate limited: wait for a pause in typing.
+    this._searchTimer = setTimeout(() => this._search(), 600);
+  }
+
+  async _searchHistory() {
+    if (!this.entityId) return;
+    const seq = (this._historySeq = (this._historySeq || 0) + 1);
+    try {
+      const resp = await this.hass.callWS({
+        type: 'calorie_tracker/search_history',
+        entity_id: this.entityId,
+        query: this._query.trim(),
+        limit: this._query.trim() ? 8 : 6,
+      });
+      if (seq === this._historySeq) this._history = resp.results || [];
+    } catch (err) {
+      if (seq === this._historySeq) this._history = []; // older integration: just skip
+    }
   }
 
   async _search() {
     const seq = ++this._searchSeq;
-    const msg = {
-      type: 'calorie_tracker/search_foods',
-      query: this._query.trim(),
-      include_usda: this.searchUsda !== false,
-      limit: 20,
-    };
+    const msg = { type: 'calorie_tracker/search_foods', query: this._query.trim(), limit: 20 };
     if (this.usdaApiKey) msg.usda_api_key = this.usdaApiKey;
+    this._searching = true;
     try {
       const resp = await this.hass.callWS(msg);
       if (seq !== this._searchSeq) return; // a newer search is in flight
@@ -967,10 +1074,24 @@ class HfLogDialog extends LitElement {
     }
   }
 
+  get _filteredMeals() {
+    const meals = this._meals || [];
+    const tokens = this._query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (!tokens.length) {
+      return [...meals].sort((a, b) => (b.updated || '').localeCompare(a.updated || ''));
+    }
+    return meals
+      .filter((m) => {
+        const hay = `${m.name} ${(m.ingredients || []).map((i) => i.name).join(' ')}`.toLowerCase();
+        return tokens.every((t) => hay.includes(t));
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   /* ---------- units & scaling ---------- */
 
   get _unit() {
-    return this._units.find((u) => u.id === this._form.unit) || this._units.find((u) => u.id === 'g');
+    return this._units.find((u) => u.id === this._form.unit) || this._units[0];
   }
 
   /** Grams for the current amount + unit, or null when it can't be known. */
@@ -994,6 +1115,11 @@ class HfLogDialog extends LitElement {
 
   /** Default unit for a food: its first household portion, else grams. */
   _defaultAmount(item, units) {
+    // Foods logged before open at the amount you had last time.
+    if (item.last) {
+      const unit = units.find((u) => u.label === item.last.unit || (item.last.unit === 'g' && u.id === 'g'));
+      if (unit) return { unit: unit.id, amount: fmtAmount(item.last.qty) };
+    }
     const first = item.portions?.[0];
     // Branded labels like "2 tbsp" (32 g) open as 2 tbsp.
     if (first?.volume_unit && !units.some((u) => u.group === 'food' && u.g === first.per_unit_g)) {
@@ -1042,11 +1168,8 @@ class HfLogDialog extends LitElement {
       this._selected = updated;
       this._units = buildUnits(updated);
       // Only switch the unit if the user hasn't already picked one.
-      if (!this._unitTouched) {
-        this._form = this._applyScaling({ ...this._form, ...this._defaultAmount(updated, this._units) });
-      } else {
-        this._form = this._applyScaling({ ...this._form });
-      }
+      const amount = this._unitTouched ? {} : this._defaultAmount(updated, this._units);
+      this._form = this._applyScaling({ ...this._form, ...amount });
     } catch (err) {
       // Non-fatal: grams and generic volumes still work.
     } finally {
@@ -1113,39 +1236,52 @@ class HfLogDialog extends LitElement {
     return '1';
   }
 
-  /** "(1.5 cup · 355 g)", "(150 g)", "(1 cup)" — appended to the stored food name. */
-  _amountSuffix() {
+  /** Amount, unit text and grams for the current form ({} when no amount). */
+  _amountParts() {
     const amount = parseAmount(this._form.amount);
-    if (amount === null) return '';
+    if (amount === null) return {};
     const unit = this._unit;
-    const grams = this._grams();
-    const qty = fmtAmount(amount);
-    if (unit.id === 'g') return ` (${qty} g)`;
-    const unitText = unit.label.split(' (')[0];
-    if (grams === null) return ` (${qty} ${unitText})`;
-    const approx = unit.quality === 'rough' || unit.quality === 'derived' ? '~' : '';
-    return ` (${qty} ${unitText} · ${approx}${Math.round(grams)} g)`;
+    const portionsOnly = this._selected?.portions_only;
+    const grams = portionsOnly ? null : this._grams();
+    return {
+      qty: fmtAmount(amount),
+      unitText: unit.id === 'g' ? 'g' : unit.label.split(' (')[0],
+      grams,
+      approx: unit.quality === 'rough' || unit.quality === 'derived',
+    };
   }
 
-  async _save(e) {
-    e?.preventDefault();
-    const name = this._form.name.trim();
+  /** "(1.5 cup · 355 g)", "(150 g)", "(1 serving)" — appended to the stored food name. */
+  _amountSuffix() {
+    const { qty, unitText, grams, approx } = this._amountParts();
+    if (!qty) return '';
+    if (unitText === 'g') return ` (${qty} g)`;
+    if (grams === null) return ` (${qty} ${unitText})`;
+    return ` (${qty} ${unitText} · ${approx ? '~' : ''}${Math.round(grams)} g)`;
+  }
+
+  _validateForm() {
+    if (!this._form.name.trim()) return 'Give the food a name.';
     const calories = num(this._form.calories);
-    if (!name) {
-      this._error = 'Give the food a name.';
-      return;
-    }
-    if (calories === null || calories < 0) {
-      this._error = 'Enter calories, or macros to calculate them.';
-      return;
-    }
+    if (calories === null || calories < 0) return 'Enter calories, or macros to calculate them.';
     if (this._form.amount.trim() && parseAmount(this._form.amount) === null) {
-      this._error = 'Amount should be a number like 1.5 or 1 1/2.';
-      return;
+      return 'Amount should be a number like 1.5 or 1 1/2.';
     }
+    return null;
+  }
+
+  _onSubmit(e) {
+    e?.preventDefault();
+    if (this._view === 'ingredient') this._addIngredient();
+    else this._save();
+  }
+
+  async _save() {
+    this._error = this._validateForm();
+    if (this._error) return;
     const entry = {
-      food_item: `${name}${this._amountSuffix()}`,
-      calories: Math.round(calories),
+      food_item: `${this._form.name.trim()}${this._amountSuffix()}`,
+      calories: Math.round(num(this._form.calories)),
     };
     for (const key of ['p', 'c', 'f']) {
       const v = num(this._form[key]);
@@ -1153,7 +1289,6 @@ class HfLogDialog extends LitElement {
     }
 
     this._saving = true;
-    this._error = null;
     try {
       await this.hass.callWS({
         type: 'calorie_tracker/add_entry',
@@ -1170,6 +1305,133 @@ class HfLogDialog extends LitElement {
     }
   }
 
+  /* ---------- meal builder ---------- */
+
+  _newMeal() {
+    this._mealDraft = { id: null, name: this._query.trim(), servings: '1', ingredients: [] };
+    this._confirmDelete = false;
+    this._mealError = null;
+    this._resetForm();
+    this._view = 'meal';
+  }
+
+  _editMeal(meal) {
+    this._mealDraft = {
+      id: meal.id,
+      name: meal.name,
+      servings: fmtAmount(meal.servings || 1),
+      ingredients: (meal.ingredients || []).map((i) => ({ ...i })),
+    };
+    this._confirmDelete = false;
+    this._mealError = null;
+    this._resetForm();
+    this._view = 'meal';
+  }
+
+  _backToLog() {
+    this._mealDraft = null;
+    this._resetForm();
+    this._view = 'log';
+    this._focusSearch();
+  }
+
+  _backToMeal() {
+    this._resetForm();
+    this._view = 'meal';
+  }
+
+  _startIngredient() {
+    this._resetForm();
+    this._view = 'ingredient';
+    this._focusSearch();
+  }
+
+  _addIngredient() {
+    this._error = this._validateForm();
+    if (this._error) return;
+    const { qty, unitText, grams } = this._amountParts();
+    const ingredient = {
+      name: this._form.name.trim(),
+      calories: Math.round(num(this._form.calories)),
+      protein: num(this._form.p),
+      carbs: num(this._form.c),
+      fat: num(this._form.f),
+      grams: grams ? round1(grams) : null,
+      amount: qty || null,
+      unit: qty ? unitText : null,
+      source: this._selected?.id || null,
+    };
+    this._mealDraft = { ...this._mealDraft, ingredients: [...this._mealDraft.ingredients, ingredient] };
+    this._backToMeal();
+  }
+
+  _removeIngredient(index) {
+    const ingredients = this._mealDraft.ingredients.filter((_, i) => i !== index);
+    this._mealDraft = { ...this._mealDraft, ingredients };
+  }
+
+  _onMealField(field, e) {
+    this._mealDraft = { ...this._mealDraft, [field]: e.target.value };
+  }
+
+  _mealTotals() {
+    const ings = this._mealDraft?.ingredients || [];
+    const sum = (k) => ings.reduce((acc, i) => acc + (num(i[k]) || 0), 0);
+    const total = { calories: sum('calories'), p: sum('protein'), c: sum('carbs'), f: sum('fat') };
+    const servings = parseAmount(this._mealDraft?.servings) || 1;
+    const per = Object.fromEntries(Object.entries(total).map(([k, v]) => [k, v / servings]));
+    const weighed = ings.length && ings.every((i) => num(i.grams));
+    return { total, per, servings, grams: weighed ? sum('grams') : null };
+  }
+
+  async _saveMeal() {
+    const draft = this._mealDraft;
+    const servings = parseAmount(draft.servings);
+    if (!draft.name.trim()) {
+      this._mealError = 'Give the meal a name.';
+      return;
+    }
+    if (!servings) {
+      this._mealError = 'Servings should be a number like 1, 4 or 1/2.';
+      return;
+    }
+    if (!draft.ingredients.length) {
+      this._mealError = 'Add at least one ingredient.';
+      return;
+    }
+    this._mealSaving = true;
+    this._mealError = null;
+    try {
+      const meal = { name: draft.name.trim(), servings, ingredients: draft.ingredients };
+      if (draft.id) meal.id = draft.id;
+      await this.hass.callWS({ type: 'calorie_tracker/meals/save', meal });
+      await this._loadMeals();
+      this._source = 'meals';
+      saveSource('meals');
+      this._backToLog();
+    } catch (err) {
+      this._mealError = `Couldn't save the meal: ${err.message || err}`;
+    } finally {
+      this._mealSaving = false;
+    }
+  }
+
+  async _deleteMeal() {
+    if (!this._confirmDelete) {
+      this._confirmDelete = true;
+      clearTimeout(this._confirmTimer);
+      this._confirmTimer = setTimeout(() => (this._confirmDelete = false), 4000);
+      return;
+    }
+    try {
+      await this.hass.callWS({ type: 'calorie_tracker/meals/delete', meal_id: this._mealDraft.id });
+      await this._loadMeals();
+      this._backToLog();
+    } catch (err) {
+      this._mealError = `Couldn't delete: ${err.message || err}`;
+    }
+  }
+
   /* ---------- render ---------- */
 
   _resultKcal(item) {
@@ -1178,13 +1440,148 @@ class HfLogDialog extends LitElement {
   }
 
   _resultServing(item) {
+    if (item.source === 'history') {
+      const last = item.last;
+      const unitText = last.unit === 'g' ? 'g' : last.unit;
+      const grams = !item.portions_only && last.unit !== 'g' ? ` · ${Math.round(item.base_g)} g` : '';
+      const times = item.times_logged > 1 ? `${item.times_logged}× · ` : '';
+      return `${times}last ${this._shortDate(item.last_logged)} · ${fmtAmount(last.qty)} ${unitText}${grams}`;
+    }
+    if (item.source === 'meal') {
+      const portion = item.portions_only ? '1 serving' : `1 serving · ${Math.round(item.default_g)} g`;
+      return `${item.ingredient_count} ingredient${item.ingredient_count === 1 ? '' : 's'} · ${portion}`;
+    }
     const portion = item.portions?.[0];
     if (portion) return `1 ${portion.unit_label.split(' (')[0]} · ${Math.round(portion.per_unit_g)} g`;
     return `${Math.round(item.default_g || item.base_g)} g`;
   }
 
+  _shortDate(iso) {
+    const [y, m, d] = (iso || '').split('-').map(Number);
+    if (!y) return '';
+    const date = new Date(y, m - 1, d);
+    const days = Math.round((new Date().setHours(0, 0, 0, 0) - date.getTime()) / 86400000);
+    if (days <= 0) return 'today';
+    if (days === 1) return 'yesterday';
+    return date.toLocaleDateString(this.hass?.locale?.language, { month: 'short', day: 'numeric' });
+  }
+
+  _renderResult(item, meal = null) {
+    return html`
+      <div class="result">
+        <button class="result-pick" @click=${() => this._select(item)}>
+          <div class="result-main">
+            <div class="result-name">${item.name}</div>
+            <div class="result-meta">
+              <span class="chip ${item.source}">${item.source_label}</span>
+              ${item.brand ? html`<span>${item.brand}</span>` : nothing}
+              <span>${this._resultServing(item)}</span>
+            </div>
+          </div>
+          <div class="result-kcal">${this._resultKcal(item)}<span>kcal</span></div>
+        </button>
+        ${meal
+          ? html`<button class="icon-btn edit" title="Edit meal" aria-label="Edit ${meal.name}"
+              @click=${() => this._editMeal(meal)}><ha-icon icon="mdi:pencil"></ha-icon></button>`
+          : nothing}
+      </div>
+    `;
+  }
+
+  _renderSourceToggle() {
+    if (this._view === 'ingredient') return nothing;
+    const btn = (id, icon, label) => html`
+      <button role="tab" aria-selected=${this._source === id} class=${this._source === id ? 'on' : ''}
+        @click=${() => this._setSource(id)}>
+        <ha-icon icon=${icon}></ha-icon>${label}
+      </button>
+    `;
+    return html`<div class="segmented" role="tablist" aria-label="Search source">
+      ${btn('meals', 'mdi:bookmark-multiple-outline', 'My meals')}
+      ${btn('foods', 'mdi:food-apple-outline', 'Foods')}
+    </div>`;
+  }
+
+  _renderSearch() {
+    const source = this._activeSource;
+    const placeholder =
+      source === 'meals'
+        ? 'Search my meals'
+        : this._usdaEnabled
+          ? 'Search your foods, then USDA'
+          : "Search foods you've logged";
+    return html`
+      ${this._renderSourceToggle()}
+      <div class="search">
+        <ha-icon icon="mdi:magnify"></ha-icon>
+        <input id="search" type="search" autocomplete="off" placeholder=${placeholder}
+          .value=${this._query} @input=${this._onSearchInput} />
+      </div>
+      ${source === 'meals' ? this._renderMealResults() : this._renderFoodResults()}
+    `;
+  }
+
+  _renderFoodResults() {
+    const query = this._query.trim();
+    if (this._selected && !query) return nothing; // a food is picked; show the form
+    const history = this._history || [];
+    const usdaActive = this._usdaEnabled && query.length >= 2;
+    const nothingFound =
+      query.length >= 2 && !history.length && !this._results.length && !this._searching && !this._searchErrors.length;
+    if (!history.length && !usdaActive) return nothing;
+    return html`
+      <div class="results">
+        ${history.length
+          ? html`<div class="section">${query ? 'Logged before' : 'Recent'}</div>
+              ${history.map((item) => this._renderResult(item))}`
+          : nothing}
+        ${usdaActive
+          ? html`<div class="section">USDA ${this._searching ? html`<span class="spinner small"></span>` : nothing}</div>
+              ${this._searchErrors.map(
+                (msg) => html`<div class="hint warn pad">${msg}
+                  <button class="link" @click=${() => this._search()}>Retry</button></div>`,
+              )}
+              ${this._results.map((item) => this._renderResult(item))}
+              ${!this._searching && !this._searchErrors.length && !this._results.length && history.length
+                ? html`<div class="hint pad">No USDA matches.</div>`
+                : nothing}`
+          : nothing}
+        ${nothingFound ? html`<div class="hint pad">No matches. Enter it manually below.</div>` : nothing}
+      </div>
+    `;
+  }
+
+  _renderMealResults() {
+    if (this._selected && !this._query.trim()) return nothing; // a meal is picked; show the form
+    if (this._meals === null) return html`<div class="hint">Loading meals…</div>`;
+    if (this._mealsError) return html`<div class="hint warn">${this._mealsError}</div>`;
+    const meals = this._filteredMeals;
+    const newBtn = html`<button class="new-meal" @click=${this._newMeal}>
+      <ha-icon icon="mdi:plus"></ha-icon>${this._query.trim() ? `New meal “${this._query.trim()}”` : 'New meal'}
+    </button>`;
+    if (!this._meals.length) {
+      return html`<div class="empty-meals">
+        <div>No saved meals yet. Build one from ingredients and it'll show up here.</div>
+        ${newBtn}
+      </div>`;
+    }
+    return html`
+      <div class="results">
+        ${meals.length
+          ? meals.map((meal) => this._renderResult(meal.item, meal))
+          : html`<div class="hint pad">No meals match “${this._query.trim()}”.</div>`}
+        ${newBtn}
+      </div>
+    `;
+  }
+
   _renderAmountHint() {
     if (this._loadingPortions) return html`<div class="hint">Loading serving sizes…</div>`;
+    if (this._selected?.portions_only) {
+      return html`<div class="hint">${this._selected.source === 'meal'
+        ? 'Some ingredients have no weight, so this meal is logged by serving.'
+        : 'Logged before without a weight, so it scales by the amount you had last time.'}</div>`;
+    }
     const unit = this._unit;
     const grams = this._grams();
     if (unit.id === 'g' || grams === null) {
@@ -1203,7 +1600,7 @@ class HfLogDialog extends LitElement {
 
   _renderUnitSelect() {
     const groups = [
-      ['food', 'This food'],
+      ['food', this._selected?.source === 'meal' ? 'This meal' : 'This food'],
       ['volume', 'Volume'],
       ['mass', 'Weight'],
     ];
@@ -1215,7 +1612,7 @@ class HfLogDialog extends LitElement {
           return html`<optgroup label=${label}>
             ${opts.map(
               (u) => html`<option value=${u.id} ?selected=${u.id === this._form.unit}>
-                ${u.group === 'food' ? `${u.label} (${fmtAmount(u.g)} g)` : u.label}
+                ${u.group === 'food' && !this._selected?.portions_only ? `${u.label} (${fmtAmount(u.g)} g)` : u.label}
               </option>`,
             )}
           </optgroup>`;
@@ -1224,98 +1621,168 @@ class HfLogDialog extends LitElement {
     `;
   }
 
-  render() {
+  _renderFoodForm() {
     const f = this._form;
     const autoCalories = !this._caloriesTouched && f.calories !== '' && !this._selected;
+    const ingredient = this._view === 'ingredient';
+    return html`
+      <form @submit=${this._onSubmit}>
+        ${this._selected
+          ? html`<div class="selected">
+              <span>Nutrition scales with the amount (from ${this._selected.source_label}).</span>
+              <button type="button" class="link" @click=${this._clearSelection}>Unlink</button>
+            </div>`
+          : nothing}
+        <label class="full">
+          <span>${ingredient ? 'Ingredient' : 'Food name'}</span>
+          <input .value=${f.name} @input=${(e) => this._onField('name', e)} required />
+        </label>
+        <div>
+          <div class="row amount-row">
+            <label>
+              <span>Amount</span>
+              <input id="amount" type="text" inputmode="decimal" placeholder="e.g. 1 1/2"
+                .value=${String(f.amount)} @input=${(e) => this._onField('amount', e)} />
+            </label>
+            <label>
+              <span>Unit</span>
+              ${this._renderUnitSelect()}
+            </label>
+            <label>
+              <span>Calories ${autoCalories ? html`<em>from macros</em>` : nothing}</span>
+              <input type="number" inputmode="numeric" min="0" step="1"
+                .value=${String(f.calories)} @input=${(e) => this._onField('calories', e)} />
+            </label>
+          </div>
+          ${this._renderAmountHint()}
+        </div>
+        <div class="row three">
+          ${MACROS.map(
+            (m) => html`
+              <label>
+                <span><span class="dot ${m.key}"></span>${m.label} (g)</span>
+                <input type="number" inputmode="decimal" min="0" step="any"
+                  .value=${String(f[m.key])} @input=${(e) => this._onField(m.key, e)} />
+              </label>
+            `,
+          )}
+        </div>
+        ${this._error ? html`<div class="hint warn">${this._error}</div>` : nothing}
+        <div class="actions">
+          <button type="button" class="btn secondary"
+            @click=${ingredient ? this._backToMeal : this._close}>Cancel</button>
+          <button type="submit" class="btn" ?disabled=${this._saving}>
+            ${ingredient ? 'Add to meal' : this._saving ? 'Saving…' : 'Log food'}
+          </button>
+        </div>
+      </form>
+    `;
+  }
+
+  _renderMealBuilder() {
+    const d = this._mealDraft;
+    const t = this._mealTotals();
+    const macroLine = (o) => html`${MACROS.map(
+      (m) => html`<span><span class="dot ${m.key}"></span>${fmtAmount(round1(o[m.key]))}g</span>`,
+    )}`;
+    return html`
+      <div class="meal-builder">
+        <div class="row meal-head">
+          <label>
+            <span>Meal name</span>
+            <input id="meal-name" .value=${d.name} placeholder="e.g. Chicken burrito bowl"
+              @input=${(e) => this._onMealField('name', e)} />
+          </label>
+          <label>
+            <span>Makes (servings)</span>
+            <input type="text" inputmode="decimal" .value=${d.servings}
+              @input=${(e) => this._onMealField('servings', e)} />
+          </label>
+        </div>
+
+        <div class="section-label">Ingredients</div>
+        <div class="ingredients">
+          ${d.ingredients.length
+            ? d.ingredients.map(
+                (ing, i) => html`
+                  <div class="ingredient">
+                    <div class="ing-main">
+                      <div class="ing-name">${ing.name}</div>
+                      <div class="ing-meta">
+                        ${ing.amount ? html`<span>${ing.amount} ${ing.unit}${ing.grams && ing.unit !== 'g' ? ` · ${Math.round(ing.grams)} g` : ''}</span>` : nothing}
+                        ${macroLine({ p: num(ing.protein) || 0, c: num(ing.carbs) || 0, f: num(ing.fat) || 0 })}
+                      </div>
+                    </div>
+                    <div class="ing-kcal">${Math.round(ing.calories)}<span>kcal</span></div>
+                    <button class="icon-btn" aria-label="Remove ${ing.name}" @click=${() => this._removeIngredient(i)}>
+                      <ha-icon icon="mdi:close"></ha-icon>
+                    </button>
+                  </div>
+                `,
+              )
+            : html`<div class="hint pad">No ingredients yet.</div>`}
+          <button class="new-meal" @click=${this._startIngredient}>
+            <ha-icon icon="mdi:plus"></ha-icon>Add ingredient
+          </button>
+        </div>
+
+        ${d.ingredients.length
+          ? html`<div class="totals">
+              <div>
+                <div class="totals-label">Whole recipe${t.grams ? ` · ${Math.round(t.grams)} g` : ''}</div>
+                <div class="totals-kcal">${Math.round(t.total.calories)} kcal</div>
+                <div class="ing-meta">${macroLine(t.total)}</div>
+              </div>
+              <div>
+                <div class="totals-label">Per serving${t.grams ? ` · ${Math.round(t.grams / t.servings)} g` : ''}</div>
+                <div class="totals-kcal">${Math.round(t.per.calories)} kcal</div>
+                <div class="ing-meta">${macroLine(t.per)}</div>
+              </div>
+            </div>`
+          : nothing}
+
+        ${this._mealError ? html`<div class="hint warn">${this._mealError}</div>` : nothing}
+        <div class="actions">
+          ${d.id
+            ? html`<button type="button" class="btn danger ${this._confirmDelete ? 'confirm' : ''}" @click=${this._deleteMeal}>
+                ${this._confirmDelete ? 'Tap again to delete' : 'Delete'}
+              </button>`
+            : nothing}
+          <span class="spacer"></span>
+          <button type="button" class="btn secondary" @click=${this._backToLog}>Cancel</button>
+          <button type="button" class="btn" ?disabled=${this._mealSaving} @click=${this._saveMeal}>
+            ${this._mealSaving ? 'Saving…' : 'Save meal'}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  render() {
+    const titles = {
+      log: 'Log food',
+      meal: this._mealDraft?.id ? 'Edit meal' : 'New meal',
+      ingredient: 'Add ingredient',
+    };
+    const back = this._view === 'ingredient' ? this._backToMeal : this._view === 'meal' ? this._backToLog : null;
     return html`
       <div class="backdrop" @click=${this._close}></div>
       <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="hf-title">
         <div class="dialog-head">
-          <h2 id="hf-title">Log food</h2>
-          <button class="icon-btn" @click=${this._close} aria-label="Close">
+          ${back
+            ? html`<button class="icon-btn" @click=${back} aria-label="Back"><ha-icon icon="mdi:arrow-left"></ha-icon></button>`
+            : nothing}
+          <h2 id="hf-title">${titles[this._view]}</h2>
+          ${this._view === 'ingredient' && this._mealDraft?.name
+            ? html`<span class="head-sub">to ${this._mealDraft.name}</span>`
+            : nothing}
+          <button class="icon-btn close" @click=${this._close} aria-label="Close">
             <ha-icon icon="mdi:close"></ha-icon>
           </button>
         </div>
-
-        <div class="search">
-          <ha-icon icon="mdi:magnify"></ha-icon>
-          <input id="search" type="search" autocomplete="off"
-            placeholder=${this.searchUsda === false ? 'Search your foods database' : 'Search foods or brands (USDA + your foods database)'}
-            .value=${this._query} @input=${this._onSearchInput} />
-          ${this._searching ? html`<span class="spinner"></span>` : nothing}
-        </div>
-        ${this._searchErrors.map((msg) => html`<div class="hint warn">${msg}</div>`)}
-        ${this._results.length
-          ? html`<div class="results">
-              ${this._results.map(
-                (item) => html`
-                  <button class="result" @click=${() => this._select(item)}>
-                    <div class="result-main">
-                      <div class="result-name">${item.name}</div>
-                      <div class="result-meta">
-                        <span class="chip ${item.source}">${item.source_label}</span>
-                        ${item.brand && item.source !== 'local' ? html`<span>${item.brand}</span>` : nothing}
-                        <span>${this._resultServing(item)}</span>
-                      </div>
-                    </div>
-                    <div class="result-kcal">${this._resultKcal(item)}<span>kcal</span></div>
-                  </button>
-                `,
-              )}
-            </div>`
-          : !this._searching && this._query.trim().length >= 2 && !this._searchErrors.length
-            ? html`<div class="hint">No matches. Enter it manually below.</div>`
-            : nothing}
-
-        <form @submit=${this._save}>
-          ${this._selected
-            ? html`<div class="selected">
-                <span>Nutrition scales with the amount (from ${this._selected.source_label}).</span>
-                <button type="button" class="link" @click=${this._clearSelection}>Unlink</button>
-              </div>`
-            : nothing}
-          <label class="full">
-            <span>Food name</span>
-            <input .value=${f.name} @input=${(e) => this._onField('name', e)} required />
-          </label>
-          <div>
-            <div class="row amount-row">
-              <label>
-                <span>Amount</span>
-                <input id="amount" type="text" inputmode="decimal" placeholder="e.g. 1 1/2"
-                  .value=${String(f.amount)} @input=${(e) => this._onField('amount', e)} />
-              </label>
-              <label>
-                <span>Unit</span>
-                ${this._renderUnitSelect()}
-              </label>
-              <label>
-                <span>Calories ${autoCalories ? html`<em>from macros</em>` : nothing}</span>
-                <input type="number" inputmode="numeric" min="0" step="1"
-                  .value=${String(f.calories)} @input=${(e) => this._onField('calories', e)} />
-              </label>
-            </div>
-            ${this._renderAmountHint()}
-          </div>
-          <div class="row three">
-            ${MACROS.map(
-              (m) => html`
-                <label>
-                  <span><span class="dot ${m.key}"></span>${m.label} (g)</span>
-                  <input type="number" inputmode="decimal" min="0" step="any"
-                    .value=${String(f[m.key])} @input=${(e) => this._onField(m.key, e)} />
-                </label>
-              `,
-            )}
-          </div>
-          ${this._error ? html`<div class="hint warn">${this._error}</div>` : nothing}
-          <div class="actions">
-            <button type="button" class="btn secondary" @click=${this._close}>Cancel</button>
-            <button type="submit" class="btn" ?disabled=${this._saving}>
-              ${this._saving ? 'Saving…' : 'Log food'}
-            </button>
-          </div>
-        </form>
+        ${this._view === 'meal'
+          ? this._renderMealBuilder()
+          : html`${this._renderSearch()} ${this._renderFoodForm()}`}
       </div>
     `;
   }
@@ -1361,7 +1828,7 @@ class HfLogDialog extends LitElement {
         .dialog-head {
           display: flex;
           align-items: center;
-          justify-content: space-between;
+          gap: 4px;
           margin-bottom: 12px;
         }
         h2 { margin: 0; font-size: 1.25rem; font-weight: 500; }
@@ -1412,23 +1879,118 @@ class HfLogDialog extends LitElement {
           border-radius: 12px;
         }
         .result {
+          display: flex;
+          align-items: center;
+          border-bottom: 1px solid var(--hf-divider);
+        }
+        .result-pick {
+          flex: 1;
+          min-width: 0;
           display: grid;
           grid-template-columns: minmax(0, 1fr) auto;
           gap: 10px;
           align-items: center;
-          width: 100%;
           text-align: left;
           background: none;
           border: none;
-          border-bottom: 1px solid var(--hf-divider);
           padding: 10px 12px;
           color: inherit;
         }
-        .result:last-child { border-bottom: none; }
-        .result:hover, .result:focus-visible {
+        .result-pick:hover, .result-pick:focus-visible, .new-meal:hover, .new-meal:focus-visible {
           background: var(--secondary-background-color, rgba(127, 127, 127, 0.1));
           outline: none;
         }
+        .icon-btn.edit { margin-right: 6px; }
+        .icon-btn ha-icon { --mdc-icon-size: 20px; }
+        .segmented {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 4px;
+          padding: 4px;
+          margin-bottom: 10px;
+          border-radius: 12px;
+          background: var(--secondary-background-color, rgba(127, 127, 127, 0.1));
+        }
+        .segmented button {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          padding: 8px;
+          border: none;
+          border-radius: 9px;
+          background: transparent;
+          color: var(--hf-muted);
+          font-weight: 500;
+        }
+        .segmented button ha-icon { --mdc-icon-size: 18px; }
+        .segmented button.on {
+          background: var(--card-background-color, #fff);
+          color: var(--primary-text-color);
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+        }
+        .new-meal {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          width: 100%;
+          padding: 10px 12px;
+          border: none;
+          background: none;
+          color: var(--primary-color);
+          font-weight: 600;
+          text-align: left;
+        }
+        .new-meal ha-icon { --mdc-icon-size: 18px; }
+        .empty-meals {
+          margin-top: 8px;
+          padding: 14px 12px 4px;
+          border: 1px dashed var(--hf-divider);
+          border-radius: 12px;
+          font-size: 0.85rem;
+          color: var(--hf-muted);
+        }
+        .empty-meals .new-meal { padding-left: 0; }
+        .hint.pad { padding: 4px 12px 8px; }
+        .head-sub { color: var(--hf-muted); font-size: 0.85rem; margin-left: 6px; }
+        .dialog-head .close { margin-left: auto; }
+        .meal-builder { display: flex; flex-direction: column; gap: 12px; }
+        .row.meal-head { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+        .section-label { font-size: 0.78rem; color: var(--hf-muted); margin-bottom: -6px; }
+        .ingredients { border: 1px solid var(--hf-divider); border-radius: 12px; }
+        .ingredient {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto auto;
+          gap: 8px;
+          align-items: center;
+          padding: 8px 6px 8px 12px;
+          border-bottom: 1px solid var(--hf-divider);
+        }
+        .ing-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ing-meta {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          font-size: 0.75rem;
+          color: var(--hf-muted);
+          margin-top: 2px;
+        }
+        .ing-meta .dot { width: 6px; height: 6px; margin-right: 3px; }
+        .ing-kcal, .totals-kcal { font-weight: 600; text-align: right; }
+        .ing-kcal span { display: block; font-size: 0.65rem; font-weight: 400; color: var(--hf-muted); }
+        .totals {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+          padding: 10px 12px;
+          border-radius: 12px;
+          background: var(--secondary-background-color, rgba(127, 127, 127, 0.08));
+        }
+        .totals-label { font-size: 0.75rem; color: var(--hf-muted); }
+        .totals-kcal { text-align: left; font-size: 1.1rem; margin: 2px 0; }
+        .actions .spacer { flex: 1; }
+        .btn.danger { background: transparent; color: var(--hf-over); border: 1px solid var(--hf-divider); }
+        .btn.danger.confirm { background: var(--hf-over); color: #fff; border-color: var(--hf-over); }
         .result-name {
           font-weight: 500;
           white-space: nowrap;
@@ -1452,7 +2014,22 @@ class HfLogDialog extends LitElement {
           background: var(--hf-divider);
           color: var(--primary-text-color);
         }
-        .chip.local { background: var(--primary-color); color: var(--text-primary-color, #fff); }
+        .chip.meal { background: var(--primary-color); color: var(--text-primary-color, #fff); }
+        .chip.history { background: transparent; border: 1px solid var(--primary-color); color: var(--primary-color); }
+        .section {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 12px 4px;
+          font-size: 0.7rem;
+          font-weight: 600;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--hf-muted);
+          border-bottom: 1px solid var(--hf-divider);
+        }
+        .spinner.small { width: 11px; height: 11px; border-width: 2px; }
+        .hint.warn .link { margin-left: 6px; }
         .result-kcal { font-size: 1.15rem; font-weight: 600; text-align: right; }
         .result-kcal span { display: block; font-size: 0.65rem; font-weight: 400; color: var(--hf-muted); }
         .hint { font-size: 0.8rem; color: var(--hf-muted); margin: 8px 2px 0; }
